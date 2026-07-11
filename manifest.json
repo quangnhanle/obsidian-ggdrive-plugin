@@ -1,6 +1,6 @@
 {
-	"id": "google-drive-sync",
-	"name": "Google Drive Sync",
+	"id": "obsidian-ggdrive-plugin",
+	"name": "Obsidian Google Drive Sync",
 	"version": "2.2.2",
 	"minAppVersion": "1.6.0",
 	"description": "Syncs a vault into Google Drive for cross-platform use (works for iOS).",
