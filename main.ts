@@ -319,7 +319,7 @@ class SettingsTab extends PluginSettingTab {
 		containerEl.empty();
 
 		containerEl.createEl("a", {
-			href: "https://ogd.richardxiong.com",
+			href: "https://obsidian-google-drive-website-ten.vercel.app",
 			text: "Get refresh token",
 		});
 

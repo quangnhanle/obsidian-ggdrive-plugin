@@ -5,7 +5,7 @@ This is an unofficial sync plugin for Obsidian, specifically for Google Drive.
 ## Disclaimer
 
 -   This is **not** the [official sync service](https://obsidian.md/sync) provided by Obsidian
--   This plugin communicates with external servers, namely the Google Drive API and [https://ogd.richardxiong.com](https://ogd.richardxiong.com)
+-   This plugin communicates with external servers, namely the Google Drive API and [https://obsidian-google-drive-website-ten.vercel.app](https://ogd.richardxiong.com)
     -   The details of this communication are explained at the bottom of the notes section
 
 ## Caution

@@ -40,7 +40,7 @@ export const getDriveKy = (t: ObsidianGoogleDrive) => {
 export const refreshAccessToken = async (t: ObsidianGoogleDrive) => {
 	try {
 		const { expires_in, access_token } = await ky
-			.post("https://ogd.richardxiong.com/api/access", {
+			.post("https://obsidian-google-drive-website-ten.vercel.app/api/access", {
 				json: { refresh_token: t.settings.refreshToken },
 			})
 			.json<any>();
