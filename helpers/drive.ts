@@ -167,33 +167,55 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		) as FileMetadata[];
 	};
 
-	const getRootFolderId = async () => {
-		const files = await searchFiles(
-			{
-				matches: [{ properties: { obsidian: "vault" } }],
-			},
-			true
-		);
-		if (!files) return;
-		if (!files.length) {
-			const rootFolder = await drive
-				.post(`drive/v3/files`, {
-					json: {
-						name: t.app.vault.getName(),
-						mimeType: folderMimeType,
-						description: "Obsidian Vault: " + t.app.vault.getName(),
-						properties: {
-							obsidian: "vault",
-							vault: t.app.vault.getName(),
+	// Memoized so concurrent callers (parallel folder/file creation during the
+	// first push) share a single lookup-or-create instead of each racing to
+	// create its own duplicate root folder. Reset to null on failure so a later
+	// call can retry.
+	let rootFolderPromise: Promise<string | undefined> | null = null;
+
+	const getRootFolderId = () => {
+		if (rootFolderPromise) return rootFolderPromise;
+
+		rootFolderPromise = (async () => {
+			const files = await searchFiles(
+				{
+					matches: [{ properties: { obsidian: "vault" } }],
+				},
+				true
+			);
+			if (!files) return;
+			if (!files.length) {
+				const rootFolder = await drive
+					.post(`drive/v3/files`, {
+						json: {
+							name: t.app.vault.getName(),
+							mimeType: folderMimeType,
+							description:
+								"Obsidian Vault: " + t.app.vault.getName(),
+							properties: {
+								obsidian: "vault",
+								vault: t.app.vault.getName(),
+							},
 						},
-					},
-				})
-				.json<any>();
-			if (!rootFolder) return;
-			return rootFolder.id as string;
-		} else {
-			return files[0].id as string;
-		}
+					})
+					.json<any>();
+				if (!rootFolder) return;
+				return rootFolder.id as string;
+			} else {
+				return files[0].id as string;
+			}
+		})();
+
+		rootFolderPromise.then(
+			(id) => {
+				if (!id) rootFolderPromise = null;
+			},
+			() => {
+				rootFolderPromise = null;
+			}
+		);
+
+		return rootFolderPromise;
 	};
 
 	const createFolder = async ({
