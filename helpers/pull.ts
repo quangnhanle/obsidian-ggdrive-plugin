@@ -223,36 +223,52 @@ export const pull = async (
 			return;
 		}
 
-		if (isConfigPath(path)) {
-			if (!isSyncableConfigFile(t, path)) return;
-			const content = await t.drive.getFile(node.id).arrayBuffer();
-			await ensureConfigDir(path);
-			return t.upsertFile(path, content, node.modifiedTime);
-		}
+		const isConfig = isConfigPath(path);
+		if (isConfig && !isSyncableConfigFile(t, path)) return;
 
-		const localFile = vault.getFileByPath(path);
-		const localExists = localFile || (await adapter.exists(path));
-		const op = t.settings.operations[path];
-
-		if (localExists) {
-			// Local prioritization: an unsynced local change wins.
-			if (op === "modify") return;
-			if (op === "create") {
-				// Both sides created this path; keep local and push it up.
-				t.settings.operations[path] = "modify";
-				return;
+		const localFile = isConfig ? null : vault.getFileByPath(path);
+		if (!isConfig) {
+			const localExists = localFile || (await adapter.exists(path));
+			const op = t.settings.operations[path];
+			if (localExists) {
+				// Local prioritization: an unsynced local change wins.
+				if (op === "modify") return;
+				if (op === "create") {
+					// Both sides created this path; keep local and push it up.
+					t.settings.operations[path] = "modify";
+					return;
+				}
+				if (!isModify) {
+					// First time we've seen this Drive id and a local file
+					// already exists with no pending change (e.g. a Google Drive
+					// for Desktop mirror): adopt the local copy as-is. No
+					// download, no re-push - assumed already in sync.
+					return;
+				}
+				// isModify with no local op -> Drive is authoritative; overwrite.
 			}
-			if (!isModify) {
-				// First time we've seen this Drive id and a local file already
-				// exists with no pending change (e.g. a Google Drive for Desktop
-				// mirror): adopt the local copy as-is. No download, no re-push -
-				// the two are assumed already in sync by whatever created them.
-				return;
-			}
-			// isModify with no local op -> Drive is authoritative; overwrite.
 		}
 
 		const content = await t.drive.getFile(node.id).arrayBuffer();
+
+		// A failed download comes back as an empty body (the response hook
+		// swallows HTTP errors). Never overwrite an existing non-empty local
+		// file with empty content - that corrupts files and, for plugin code,
+		// can disable the plugin.
+		if (content.byteLength === 0) {
+			const stat = await adapter.stat(path);
+			if (stat && stat.size > 0) {
+				new Notice(
+					`Skipped "${path}" - the download came back empty (possible network error). Left the local file untouched.`
+				);
+				return;
+			}
+		}
+
+		if (isConfig) {
+			await ensureConfigDir(path);
+			return t.upsertFile(path, content, node.modifiedTime);
+		}
 		if (localFile instanceof TFile) {
 			return t.modifyFile(localFile, content, node.modifiedTime);
 		}

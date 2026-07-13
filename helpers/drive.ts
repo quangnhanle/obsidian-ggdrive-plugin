@@ -55,6 +55,11 @@ export const BLACKLISTED_CONFIG_FILES = [
 	"graph.json",
 	"workspace.json",
 	"workspace-mobile.json",
+	// Plugin/core enable-state is device- and platform-specific. Syncing it can
+	// disable plugins (including THIS one) after a restart, so never mirror it.
+	"community-plugins.json",
+	"core-plugins.json",
+	"core-plugins-migration.json",
 ];
 
 export const WHITELISTED_PLUGIN_FILES = [
@@ -683,19 +688,19 @@ export const getSyncMessage = (
 
 export const fileNameFromPath = (path: string) => path.split("/").slice(-1)[0];
 
-// Path of THIS plugin's own data.json (holds device-local state + the refresh
-// token). It must never be synced in either direction.
-export const ownDataJsonPath = (t: ObsidianGoogleDrive) =>
-	t.manifest.dir ? t.manifest.dir + "/data.json" : null;
-
 // Decides whether a file inside the config dir (.obsidian) may be mirrored:
-// excludes device-specific files, non-whitelisted plugin files, and our own
-// data.json. Kept in one place so push and pull stay symmetric.
+// excludes device-specific files, non-whitelisted plugin files, and - crucially
+// - THIS plugin's own folder. Overwriting our own running code (main.js) or
+// state (data.json, which also holds the refresh token) can disable the plugin
+// or leak the token. Kept in one place so push and pull stay symmetric.
 export const isSyncableConfigFile = (
 	t: ObsidianGoogleDrive,
 	path: string
 ) => {
-	if (path === ownDataJsonPath(t)) return false;
+	const ownDir = t.manifest.dir;
+	if (ownDir && (path === ownDir || path.startsWith(ownDir + "/"))) {
+		return false;
+	}
 	const name = fileNameFromPath(path);
 	if (BLACKLISTED_CONFIG_FILES.includes(name)) return false;
 	if (path.startsWith(t.app.vault.configDir + "/plugins/")) {
