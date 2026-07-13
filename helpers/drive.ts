@@ -1,7 +1,7 @@
 import ky from "ky";
 import ObsidianGoogleDrive from "main";
 import { getDriveKy } from "./ky";
-import { TAbstractFile, TFolder } from "obsidian";
+import { Notice, TAbstractFile, TFolder } from "obsidian";
 
 export interface FileMetadata {
 	id: string;
@@ -12,6 +12,29 @@ export interface FileMetadata {
 	properties: Record<string, string>;
 	modifiedTime: string;
 }
+
+// A single node of the Drive folder tree, keyed by Drive file id. `path` is the
+// vault-relative path derived from the parent chain (root folder's path is "").
+export interface DriveTreeNode {
+	id: string;
+	path: string;
+	mimeType: string;
+	modifiedTime: string;
+	parentId: string | null;
+	isFolder: boolean;
+}
+
+export type DriveTree = Record<string, DriveTreeNode>;
+
+// Persisted projection of the tree from the previous sync. Diffing it against a
+// freshly-walked tree (by id) yields creates/deletes/renames/modifies.
+export interface SnapshotEntry {
+	path: string;
+	modifiedTime: string;
+	isFolder: boolean;
+}
+
+export type DriveSnapshot = Record<string, SnapshotEntry>;
 
 type StringSearch = string | { contains: string } | { not: string };
 type DateComparison = { eq: string } | { gt: string } | { lt: string };
@@ -28,36 +51,45 @@ interface QueryMatch {
 
 export const folderMimeType = "application/vnd.google-apps.folder";
 
-const BLACKLISTED_CONFIG_FILES = [
+export const BLACKLISTED_CONFIG_FILES = [
 	"graph.json",
 	"workspace.json",
 	"workspace-mobile.json",
 ];
 
-const WHITELISTED_PLUGIN_FILES = [
+export const WHITELISTED_PLUGIN_FILES = [
 	"manifest.json",
 	"styles.css",
 	"main.js",
 	"data.json",
 ];
 
+// Google Drive query strings wrap values in single quotes, so any backslash or
+// single quote inside a value (e.g. a file named "John's notes.md") must be
+// escaped or the query becomes malformed and the API rejects it with a 400.
+const escapeQueryValue = (value: string) =>
+	value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
 const stringSearchToQuery = (search: StringSearch) => {
-	if (typeof search === "string") return `='${search}'`;
-	if ("contains" in search) return ` contains '${search.contains}'`;
-	if ("not" in search) return `!='${search.not}'`;
+	if (typeof search === "string") return `='${escapeQueryValue(search)}'`;
+	if ("contains" in search)
+		return ` contains '${escapeQueryValue(search.contains)}'`;
+	if ("not" in search) return `!='${escapeQueryValue(search.not)}'`;
 };
 
 const queryHandlers = {
 	name: (name: StringSearch) => "name" + stringSearchToQuery(name),
 	mimeType: (mimeType: StringSearch) =>
 		"mimeType" + stringSearchToQuery(mimeType),
-	parent: (parent: string) => `'${parent}' in parents`,
+	parent: (parent: string) => `'${escapeQueryValue(parent)}' in parents`,
 	starred: (starred: boolean) => `starred=${starred}`,
-	query: (query: string) => `fullText contains '${query}'`,
+	query: (query: string) => `fullText contains '${escapeQueryValue(query)}'`,
 	properties: (properties: Record<string, string>) =>
 		Object.entries(properties).map(
 			([key, value]) =>
-				`properties has { key='${key}' and value='${value}' }`
+				`properties has { key='${escapeQueryValue(
+					key
+				)}' and value='${escapeQueryValue(value)}' }`
 		),
 	modifiedTime: (modifiedTime: DateComparison) => {
 		if ("eq" in modifiedTime) return `modifiedTime='${modifiedTime.eq}'`;
@@ -92,9 +124,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						)
 						.join(" and ")})`;
 				})
-				.join(
-					" or "
-				)}) and trashed=false and properties has { key='vault' and value='${t.app.vault.getName()}' }`
+				.join(" or ")}) and trashed=false`
 		);
 
 	const paginateFiles = async ({
@@ -167,43 +197,68 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		) as FileMetadata[];
 	};
 
-	// Memoized so concurrent callers (parallel folder/file creation during the
-	// first push) share a single lookup-or-create instead of each racing to
-	// create its own duplicate root folder. Reset to null on failure so a later
-	// call can retry.
+	// Memoized so concurrent callers share a single resolution instead of each
+	// racing. Reset to null on failure so a later call can retry.
 	let rootFolderPromise: Promise<string | undefined> | null = null;
 
+	// Resolves the vault's root folder on Drive WITHOUT relying on the
+	// plugin-specific `obsidian`/`vault` properties, so it also finds folders
+	// created by Google Drive for Desktop. Order: pinned id -> folder named
+	// after the vault -> legacy tagged folder. Never auto-creates (that would
+	// reintroduce a duplicate tagged folder and confuse the tree walk).
 	const getRootFolderId = () => {
 		if (rootFolderPromise) return rootFolderPromise;
 
 		rootFolderPromise = (async () => {
-			const files = await searchFiles(
-				{
-					matches: [{ properties: { obsidian: "vault" } }],
-				},
+			const vaultName = t.app.vault.getName();
+
+			// 1. Pinned id from a previous resolution. Drive ids are stable
+			// across renames/moves, so this is the most robust anchor.
+			if (t.settings.rootFolderId) {
+				const meta = await drive
+					.get(
+						`drive/v3/files/${t.settings.rootFolderId}?fields=id,trashed`
+					)
+					.json<any>()
+					.catch(() => null);
+				if (meta?.id && !meta.trashed) return meta.id as string;
+			}
+
+			// 2. A folder named exactly after the vault.
+			const byName = await searchFiles(
+				{ matches: [{ name: vaultName, mimeType: folderMimeType }] },
 				true
 			);
-			if (!files) return;
-			if (!files.length) {
-				const rootFolder = await drive
-					.post(`drive/v3/files`, {
-						json: {
-							name: t.app.vault.getName(),
-							mimeType: folderMimeType,
-							description:
-								"Obsidian Vault: " + t.app.vault.getName(),
-							properties: {
-								obsidian: "vault",
-								vault: t.app.vault.getName(),
-							},
-						},
-					})
-					.json<any>();
-				if (!rootFolder) return;
-				return rootFolder.id as string;
-			} else {
-				return files[0].id as string;
+			if (!byName) return;
+			if (byName.length === 1) {
+				t.settings.rootFolderId = byName[0].id;
+				return byName[0].id as string;
 			}
+			if (byName.length > 1) {
+				new Notice(
+					`Found ${byName.length} Google Drive folders named "${vaultName}". Set the exact folder ID in the plugin settings to disambiguate.`,
+					0
+				);
+				return;
+			}
+
+			// 3. Legacy fallback: a folder this plugin tagged before (handles
+			// existing users who renamed their Drive root - README allows it).
+			const tagged = await searchFiles(
+				{ matches: [{ properties: { obsidian: "vault" } }] },
+				true
+			);
+			if (!tagged) return;
+			if (tagged.length) {
+				t.settings.rootFolderId = tagged[0].id;
+				return tagged[0].id as string;
+			}
+
+			new Notice(
+				`No Google Drive folder named "${vaultName}" was found. Create and populate it (e.g. with Google Drive for Desktop) before syncing.`,
+				0
+			);
+			return;
 		})();
 
 		rootFolderPromise.then(
@@ -236,9 +291,6 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			if (!parent) return;
 		}
 
-		if (!properties) properties = {};
-		if (!properties.vault) properties.vault = t.app.vault.getName();
-
 		const folder = await drive
 			.post(`drive/v3/files`, {
 				json: {
@@ -267,10 +319,6 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		}
 
 		if (!metadata) metadata = {};
-		if (!metadata.properties) metadata.properties = {};
-		if (!metadata.properties.vault) {
-			metadata.properties.vault = t.app.vault.getName();
-		}
 
 		const form = new FormData();
 		form.append(
@@ -351,23 +399,131 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 	const getFileMetadata = (id: string) =>
 		drive.get(`drive/v3/files/${id}`).json<FileMetadata>();
 
-	const idFromPath = async (path: string) => {
-		const files = await searchFiles({
-			matches: [{ properties: { path } }],
-		});
-		if (!files?.length) return;
-		return files[0].id as string;
-	};
+	// Walks the whole folder tree under `rootId`, deriving each item's
+	// vault-relative path from its position in the tree (NOT from a `path`
+	// property), so it enumerates files created by any means, including Google
+	// Drive for Desktop. This is the ONLY vault-content enumerator - it keeps
+	// the query scoped to descendants of the root instead of the whole account.
+	//
+	// Throws if any page fetch fails, so callers abort before acting on a
+	// truncated tree (a partial tree would look like a mass deletion).
+	const buildDriveTree = async (rootId: string): Promise<DriveTree> => {
+		const tree: DriveTree = {
+			[rootId]: {
+				id: rootId,
+				path: "",
+				mimeType: folderMimeType,
+				modifiedTime: "",
+				parentId: null,
+				isFolder: true,
+			},
+		};
+		// path -> id, to detect two Drive items resolving to one local path.
+		const pathToId: Record<string, string> = { "": rootId };
 
-	const idsFromPaths = async (paths: string[]) => {
-		const files = await searchFiles({
-			matches: paths.map((path) => ({ properties: { path } })),
-		});
-		if (!files) return;
-		return files.map((file) => ({
-			id: file.id,
-			path: file.properties.path,
-		}));
+		const fetchChildren = async (parentIds: string[]) => {
+			const q = `(${parentIds
+				.map((id) => `'${escapeQueryValue(id)}' in parents`)
+				.join(" or ")}) and trashed=false`;
+
+			const files: {
+				id: string;
+				name: string;
+				mimeType: string;
+				modifiedTime: string;
+				parents?: string[];
+			}[] = [];
+			let pageToken: string | undefined;
+			do {
+				const page = await drive
+					.get(
+						`drive/v3/files?fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents)&pageSize=1000&q=${encodeURIComponent(
+							q
+						)}${pageToken ? "&pageToken=" + pageToken : ""}`
+					)
+					.json<any>();
+				if (!page) {
+					throw new Error(
+						"Failed to list a page of Google Drive files while building the vault tree."
+					);
+				}
+				files.push(...page.files);
+				pageToken = page.nextPageToken;
+			} while (pageToken);
+
+			return files;
+		};
+
+		let frontier = [rootId];
+		while (frontier.length) {
+			const parentSet = new Set(frontier);
+
+			// Chunk parents so the OR query stays within Drive's length limits,
+			// then run the chunks concurrently.
+			const chunks: string[][] = [];
+			for (let i = 0; i < frontier.length; i += 40) {
+				chunks.push(frontier.slice(i, i + 40));
+			}
+			const children = (
+				await batchAsyncs(chunks.map((chunk) => () => fetchChildren(chunk)))
+			).flat() as {
+				id: string;
+				name: string;
+				mimeType: string;
+				modifiedTime: string;
+				parents?: string[];
+			}[];
+
+			const nextFrontier: string[] = [];
+			for (const file of children) {
+				if (!file || tree[file.id]) continue; // Already placed (shallowest wins).
+
+				// A file may list several parents; use one inside the level we
+				// just queried so the derived path stays within the vault tree.
+				const parentId =
+					file.parents?.find((p) => parentSet.has(p)) ??
+					file.parents?.[0];
+				const parent = parentId ? tree[parentId] : undefined;
+				if (!parent) continue;
+
+				const path = parent.path
+					? `${parent.path}/${file.name}`
+					: file.name;
+				const isFolder = file.mimeType === folderMimeType;
+
+				const rivalId = pathToId[path];
+				if (rivalId) {
+					// Two ids collide on one path; keep the newer, drop the other.
+					const rival = tree[rivalId];
+					new Notice(
+						`Google Drive has two items at "${path}". Keeping the most recently modified one; please remove the duplicate.`
+					);
+					if (
+						new Date(rival.modifiedTime || 0).getTime() >=
+						new Date(file.modifiedTime || 0).getTime()
+					) {
+						continue;
+					}
+					delete tree[rivalId];
+				}
+
+				tree[file.id] = {
+					id: file.id,
+					path,
+					mimeType: file.mimeType,
+					modifiedTime: file.modifiedTime,
+					parentId: parent.id,
+					isFolder,
+				};
+				pathToId[path] = file.id;
+
+				if (isFolder) nextFrontier.push(file.id);
+			}
+
+			frontier = nextFrontier;
+		}
+
+		return tree;
 	};
 
 	const batchDelete = async (ids: string[]) => {
@@ -399,47 +555,6 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			.text();
 		if (!result) return;
 		return result;
-	};
-
-	const getChangesStartToken = async () => {
-		const result = await drive
-			.get(`drive/v3/changes/startPageToken`)
-			.json<any>();
-		if (!result) return;
-		return result.startPageToken as string;
-	};
-
-	const getChanges = async (startToken: string) => {
-		if (!startToken) return [];
-
-		const request = (token: string) =>
-			drive
-				.get(
-					`drive/v3/changes?${new URLSearchParams({
-						pageToken: token,
-						pageSize: "1000",
-						includeRemoved: "true",
-					}).toString()}`
-				)
-				.json<any>();
-
-		const result = await request(startToken);
-		if (!result) return;
-		while (result.nextPageToken) {
-			const nextPage = await request(result.nextPageToken);
-			if (!nextPage) return;
-			result.changes.push(...nextPage.changes);
-			result.newStartPageToken = nextPage.newStartPageToken;
-			result.nextPageToken = nextPage.nextPageToken;
-		}
-
-		return result.changes as {
-			kind: string;
-			removed: boolean;
-			file: FileMetadata;
-			fileId: string;
-			time: string;
-		}[];
 	};
 
 	const deleteFilesMinimumOperations = async (files: TAbstractFile[]) => {
@@ -487,12 +602,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 		await Promise.all(
 			configFiles.files
-				.filter(
-					(path) =>
-						!BLACKLISTED_CONFIG_FILES.includes(
-							fileNameFromPath(path)
-						)
-				)
+				.filter((path) => isSyncableConfigFile(t, path))
 				.map(async (path) => {
 					const file = await adapter.stat(path);
 					if ((file?.mtime || 0) > t.settings.lastSyncedAt) {
@@ -505,9 +615,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						await Promise.all(
 							files.files
 								.filter((path) =>
-									WHITELISTED_PLUGIN_FILES.includes(
-										fileNameFromPath(path)
-									)
+									isSyncableConfigFile(t, path)
 								)
 								.map(async (path) => {
 									const file = await adapter.stat(path);
@@ -537,10 +645,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		deleteFile,
 		getFile,
 		getFileMetadata,
-		idFromPath,
-		idsFromPaths,
-		getChangesStartToken,
-		getChanges,
+		buildDriveTree,
 		batchDelete,
 		checkConnection,
 		deleteFilesMinimumOperations,
@@ -577,6 +682,46 @@ export const getSyncMessage = (
 ) => `Syncing (${Math.floor(min + (max - min) * (completed / total))}%)`;
 
 export const fileNameFromPath = (path: string) => path.split("/").slice(-1)[0];
+
+// Path of THIS plugin's own data.json (holds device-local state + the refresh
+// token). It must never be synced in either direction.
+export const ownDataJsonPath = (t: ObsidianGoogleDrive) =>
+	t.manifest.dir ? t.manifest.dir + "/data.json" : null;
+
+// Decides whether a file inside the config dir (.obsidian) may be mirrored:
+// excludes device-specific files, non-whitelisted plugin files, and our own
+// data.json. Kept in one place so push and pull stay symmetric.
+export const isSyncableConfigFile = (
+	t: ObsidianGoogleDrive,
+	path: string
+) => {
+	if (path === ownDataJsonPath(t)) return false;
+	const name = fileNameFromPath(path);
+	if (BLACKLISTED_CONFIG_FILES.includes(name)) return false;
+	if (path.startsWith(t.app.vault.configDir + "/plugins/")) {
+		return WHITELISTED_PLUGIN_FILES.includes(name);
+	}
+	return true;
+};
+
+// Projects a walked Drive tree into the persisted snapshot + id->path map.
+export const snapshotFromTree = (tree: DriveTree) => {
+	const nodes = Object.values(tree).filter((node) => node.path !== "");
+	const driveSnapshot: DriveSnapshot = Object.fromEntries(
+		nodes.map((node): [string, SnapshotEntry] => [
+			node.id,
+			{
+				path: node.path,
+				modifiedTime: node.modifiedTime,
+				isFolder: node.isFolder,
+			},
+		])
+	);
+	const driveIdToPath: Record<string, string> = Object.fromEntries(
+		nodes.map((node) => [node.id, node.path])
+	);
+	return { driveSnapshot, driveIdToPath };
+};
 
 /**
  * @returns Batches in increasing order of depth

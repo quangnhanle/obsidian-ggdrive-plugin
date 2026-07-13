@@ -3,9 +3,10 @@ import { Modal, Notice, setIcon, Setting, TFile, TFolder } from "obsidian";
 import {
 	batchAsyncs,
 	fileNameFromPath,
-	folderMimeType,
 	foldersToBatches,
 	getSyncMessage,
+	isSyncableConfigFile,
+	snapshotFromTree,
 } from "./drive";
 import { pull } from "./pull";
 
@@ -170,25 +171,28 @@ class ConfirmUndoModal extends Modal {
 	}
 
 	async handleDelete(paths: string[]) {
-		const files = await this.t.drive.searchFiles({
-			include: ["id", "mimeType", "properties", "modifiedTime"],
-			matches: paths.map((path) => ({ properties: { path } })),
+		// Restore locally-deleted files from Drive using the last snapshot,
+		// which carries each Drive id, type and modified time.
+		const snapshot = this.t.settings.driveSnapshot;
+		const pathToEntry: Record<
+			string,
+			{ id: string; isFolder: boolean; modifiedTime: string }
+		> = {};
+		Object.entries(snapshot).forEach(([id, entry]) => {
+			if (paths.includes(entry.path)) {
+				pathToEntry[entry.path] = {
+					id,
+					isFolder: entry.isFolder,
+					modifiedTime: entry.modifiedTime,
+				};
+			}
 		});
-		if (!files) {
-			return new Notice("An error occurred fetching Google Drive files.");
-		}
-
-		const pathToFile = Object.fromEntries(
-			files.map((file) => [file.properties.path, file])
-		);
 
 		const deletedFolders = paths.filter(
-			(path) => pathToFile[path].properties.path === folderMimeType
+			(path) => pathToEntry[path]?.isFolder
 		);
-
 		if (deletedFolders.length) {
 			const batches = foldersToBatches(deletedFolders);
-
 			for (const batch of batches) {
 				await Promise.all(
 					batch.map((folder) => this.t.createFolder(folder))
@@ -197,13 +201,13 @@ class ConfirmUndoModal extends Modal {
 		}
 
 		const deletedFiles = paths.filter(
-			(path) => pathToFile[path].properties.path !== folderMimeType
+			(path) => pathToEntry[path] && !pathToEntry[path].isFolder
 		);
 
 		await batchAsyncs(
 			deletedFiles.map((path) => async () => {
 				const onlineFile = await this.t.drive
-					.getFile(this.filePathToId[path])
+					.getFile(pathToEntry[path].id)
 					.arrayBuffer();
 				if (!onlineFile) {
 					return new Notice(
@@ -213,7 +217,7 @@ class ConfirmUndoModal extends Modal {
 				return this.t.createFile(
 					path,
 					onlineFile,
-					pathToFile[path].modifiedTime
+					pathToEntry[path].modifiedTime
 				);
 			})
 		);
@@ -257,7 +261,13 @@ export const push = async (t: ObsidianGoogleDrive) => {
 
 	const syncNotice = await t.startSync();
 
-	await pull(t, true);
+	// Pull first so we're pushing on top of the latest Drive state. If the pull
+	// aborted (e.g. the root folder couldn't be resolved), don't push blindly.
+	const pulled = await pull(t, true);
+	if (!pulled) {
+		await t.endSync(syncNotice, false);
+		return;
+	}
 
 	const operations = Object.entries(t.settings.operations);
 
@@ -269,30 +279,40 @@ export const push = async (t: ObsidianGoogleDrive) => {
 		Object.entries(t.settings.driveIdToPath).map(([id, path]) => [path, id])
 	);
 
-	const configOnDrive = await t.drive.searchFiles({
-		include: ["properties"],
-		matches: [{ properties: { config: "true" } }],
+	// Config files that still exist on Drive (per the snapshot) but were removed
+	// locally should be deleted on Drive too.
+	Object.values(t.settings.driveSnapshot).forEach((entry) => {
+		if (entry.isFolder) return;
+		if (!entry.path.startsWith(vault.configDir + "/")) return;
+		if (!isSyncableConfigFile(t, entry.path)) return;
+		deletes.push([entry.path, "delete"]);
 	});
-	if (!configOnDrive) {
-		return new Notice("An error occurred fetching Google Drive files.");
-	}
-
+	// The check above only queued paths; drop ones that still exist locally.
+	const confirmedDeletes: [string, "delete"][] = [];
 	await Promise.all(
-		configOnDrive.map(async ({ properties }) => {
-			if (!(await adapter.exists(properties.path))) {
-				deletes.push([properties.path, "delete"]);
+		deletes.map(async ([path]) => {
+			if (
+				path.startsWith(vault.configDir + "/") &&
+				(await adapter.exists(path))
+			) {
+				return;
 			}
+			confirmedDeletes.push([path, "delete"]);
 		})
 	);
 
-	if (deletes.length) {
-		const deleteRequest = await t.drive.batchDelete(
-			deletes.map(([path]) => pathsToIds[path])
-		);
-		if (!deleteRequest) {
-			return new Notice("An error occurred deleting Google Drive files.");
+	if (confirmedDeletes.length) {
+		const ids = confirmedDeletes
+			.map(([path]) => pathsToIds[path])
+			.filter(Boolean);
+		if (ids.length) {
+			const deleteRequest = await t.drive.batchDelete(ids);
+			if (!deleteRequest) {
+				return new Notice(
+					"An error occurred deleting Google Drive files."
+				);
+			}
 		}
-		deletes.forEach(([path]) => delete t.settings.driveIdToPath[path]);
 	}
 
 	syncNotice.setMessage("Syncing (33%)");
@@ -318,7 +338,6 @@ export const push = async (t: ObsidianGoogleDrive) => {
 							parent: folder.parent
 								? pathsToIds[folder.parent.path]
 								: undefined,
-							properties: { path: folder.path },
 							modifiedTime: new Date().toISOString(),
 						});
 						if (!id) {
@@ -347,10 +366,7 @@ export const push = async (t: ObsidianGoogleDrive) => {
 					new Blob([await vault.readBinary(note)]),
 					note.name,
 					note.parent ? pathsToIds[note.parent.path] : undefined,
-					{
-						properties: { path: note.path },
-						modifiedTime: new Date().toISOString(),
-					}
+					{ modifiedTime: new Date().toISOString() }
 				);
 				if (!id) {
 					return new Notice(
@@ -428,7 +444,6 @@ export const push = async (t: ObsidianGoogleDrive) => {
 						parent: pathsToIds[
 							folder.split("/").slice(0, -1).join("/")
 						],
-						properties: { path: folder, config: "true" },
 						modifiedTime: new Date().toISOString(),
 					});
 					if (!id) {
@@ -459,10 +474,7 @@ export const push = async (t: ObsidianGoogleDrive) => {
 				new Blob([await adapter.readBinary(path)]),
 				fileNameFromPath(path),
 				pathsToIds[path.split("/").slice(0, -1).join("/")],
-				{
-					properties: { path, config: "true" },
-					modifiedTime: new Date().toISOString(),
-				}
+				{ modifiedTime: new Date().toISOString() }
 			);
 			if (!id) {
 				return new Notice(
@@ -475,11 +487,20 @@ export const push = async (t: ObsidianGoogleDrive) => {
 		})
 	);
 
-	await t.drive.updateFile(
-		pathsToIds[vault.configDir + "/plugins/google-drive-sync/data.json"],
-		new Blob([JSON.stringify(t.settings, null, 2)]),
-		{ modifiedTime: new Date().toISOString() }
-	);
+	// Re-walk the tree so the snapshot reflects the files we just created and
+	// modified (new ids + fresh modified times). Without this the next pull
+	// would see every pushed file as a remote change and re-download it.
+	const rootId = await t.drive.getRootFolderId();
+	if (rootId) {
+		try {
+			const tree = await t.drive.buildDriveTree(rootId);
+			const { driveSnapshot, driveIdToPath } = snapshotFromTree(tree);
+			t.settings.driveSnapshot = driveSnapshot;
+			t.settings.driveIdToPath = driveIdToPath;
+		} catch {
+			// Leave the pre-push snapshot in place; the next pull reconciles.
+		}
+	}
 
 	t.settings.operations = {};
 

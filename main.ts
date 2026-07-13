@@ -1,4 +1,4 @@
-import { checkConnection, getDriveClient } from "helpers/drive";
+import { checkConnection, DriveSnapshot, getDriveClient } from "helpers/drive";
 import { refreshAccessToken } from "helpers/ky";
 import { pull } from "helpers/pull";
 import { push } from "helpers/push";
@@ -12,6 +12,8 @@ import {
 	Setting,
 	TAbstractFile,
 	TFile,
+	TFolder,
+	Vault,
 	Menu,
 } from "obsidian";
 
@@ -20,7 +22,11 @@ interface PluginSettings {
 	operations: Record<string, "create" | "delete" | "modify">;
 	driveIdToPath: Record<string, string>;
 	lastSyncedAt: number;
-	changesToken: string;
+	// Pinned id of the vault's root folder on Drive (stable across renames).
+	rootFolderId: string;
+	// Snapshot of the Drive tree at the previous sync, keyed by Drive file id.
+	// Diffing it against a freshly-walked tree drives create/delete/rename/modify.
+	driveSnapshot: DriveSnapshot;
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
@@ -28,7 +34,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	operations: {},
 	driveIdToPath: {},
 	lastSyncedAt: 0,
-	changesToken: "",
+	rootFolderId: "",
+	driveSnapshot: {},
 };
 
 export default class ObsidianGoogleDrive extends Plugin {
@@ -181,8 +188,27 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	handleRename(file: TAbstractFile, oldPath: string) {
-		this.handleDelete({ ...file, path: oldPath });
+		this.handleDelete({ ...file, path: oldPath } as TAbstractFile);
 		this.handleCreate(file);
+
+		// When a folder is renamed/moved, Obsidian fires a single rename event
+		// for the folder only — descendants silently receive new paths without
+		// their own events. Record each descendant's move so its children are
+		// actually pushed (under the new path) and cleaned up (under the old).
+		if (file instanceof TFolder) {
+			const newPrefix = file.path;
+			Vault.recurseChildren(file, (child) => {
+				if (child.path === file.path) return;
+				const childOldPath =
+					oldPath + child.path.slice(newPrefix.length);
+				this.handleDelete({
+					...child,
+					path: childOldPath,
+				} as TAbstractFile);
+				this.handleCreate(child);
+			});
+		}
+
 		this.debouncedSaveSettings();
 	}
 
@@ -254,17 +280,19 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	async deleteFile(file: TAbstractFile) {
-		const oldOperation = this.settings.operations[file.path];
 		await this.app.fileManager.trashFile(file);
+		// This is a programmatic (pull-driven) delete, so drop any operation the
+		// vault's own delete event queued for this path — the file is gone and
+		// there is nothing left to push.
 		delete this.settings.operations[file.path];
-		if (!oldOperation) delete this.settings.operations[file.path];
 	}
 
 	async startSync() {
 		if (!(await checkConnection())) {
-			throw new Notice(
+			new Notice(
 				"You are not connected to the internet, so you cannot sync right now. Please try syncing once you have connection again."
 			);
+			throw new Error("No internet connection; sync aborted.");
 		}
 		this.ribbonIcon.addClass("spin");
 		this.syncing = true;
@@ -290,13 +318,6 @@ export default class ObsidianGoogleDrive extends Plugin {
 			this.settings.lastSyncedAt = Date.now();
 		}
 
-		const changesToken = await this.drive.getChangesStartToken();
-		if (!changesToken) {
-			return new Notice(
-				"An error occurred fetching Google Drive changes token."
-			);
-		}
-		this.settings.changesToken = changesToken;
 		await this.saveSettings();
 		this.ribbonIcon.removeClass("spin");
 		this.syncing = false;
@@ -314,7 +335,6 @@ class SettingsTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
-		const { vault } = this.app;
 
 		containerEl.empty();
 
@@ -326,15 +346,9 @@ class SettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Refresh token")
 			.setDesc(
-				"A refresh token is required to access your Google Drive for syncing. We suggest cloning your Google Drive vault to the current vault BEFORE syncing."
+				"A refresh token is required to access your Google Drive for syncing. Back up your vault before the first sync."
 			)
 			.addText((text) => {
-				const cancel = () => {
-					this.plugin.settings.refreshToken = "";
-					text.setValue("");
-					return this.plugin.saveSettings();
-				};
-
 				text.setPlaceholder("Enter your refresh token")
 					.setValue(this.plugin.settings.refreshToken)
 					.onChange(async (value) => {
@@ -346,33 +360,40 @@ class SettingsTab extends PluginSettingTab {
 							text.setValue("");
 							return;
 						}
-						if (
-							vault
-								.getAllLoadedFiles()
-								.filter(({ path }) => path !== "/").length > 0
-						) {
-							new Notice(
-								"Your current vault is not empty! If you want our plugin to handle the initial sync, you have to clear out the current vault. Check the readme or website for more details.",
-								0
-							);
-							return cancel();
-						}
 
-						const changesToken =
-							await this.plugin.drive.getChangesStartToken();
-						if (!changesToken) {
-							return new Notice(
-								"An error occurred fetching Google Drive changes token."
-							);
-						}
-						this.plugin.settings.changesToken = changesToken;
+						// Locate and pin the vault's root folder on Drive. Adopt
+						// mode supports a NON-EMPTY local vault (e.g. an existing
+						// Google Drive for Desktop mirror): the first pull
+						// reconciles existing files by modified time without
+						// overwriting newer local content. getRootFolderId
+						// surfaces its own Notice if the folder can't be found.
+						await this.plugin.drive.getRootFolderId();
 
 						await this.plugin.saveSettings();
 						new Notice(
-							"Refresh token saved! Reload Obsidian to activate sync.",
+							"Refresh token saved! Back up your vault, then reload Obsidian to activate sync.",
 							0
 						);
 					});
 			});
+
+		this.rootFolderIdSetting(containerEl);
+	}
+
+	rootFolderIdSetting(containerEl: HTMLElement) {
+		new Setting(containerEl)
+			.setName("Root folder ID (optional)")
+			.setDesc(
+				"Pin the exact Google Drive folder to sync. Leave empty to auto-match a folder named after the vault. Use this if several Drive folders share the vault's name (find the ID in the folder's URL)."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Drive folder ID")
+					.setValue(this.plugin.settings.rootFolderId)
+					.onChange((value) => {
+						this.plugin.settings.rootFolderId = value.trim();
+						this.plugin.debouncedSaveSettings();
+					})
+			);
 	}
 }

@@ -31,17 +31,19 @@ This is an unofficial sync plugin for Obsidian, specifically for Google Drive.
 
 ## Notes
 
--   Do **NOT** manually upload files into the generated Obsidian Google Drive folder or use some other method of Google Drive sync
-    -   Our plugin cannot see these files, and it will likely break functionality, potentially causing data loss
-    -   Instead, use this plugin on any device you wish to sync the vault between
--   Do **NOT** manually change files outside of the Obsidian app
-    -   Our plugin tracks file changes through the Obsidian API, and if you change files outside of the app, the plugin will not be able to track these changes
+-   You CAN populate the Google Drive folder by any means, including Google Drive for Desktop or manual uploads
+    -   The plugin identifies files by walking the Drive folder tree (by name/hierarchy), not by hidden tags, so it picks up files added by other tools on the next pull
+    -   Google-format files (Docs, Sheets, Slides, etc.) are skipped because they have no downloadable file contents
+-   Local changes made outside of the Obsidian app (while Obsidian is closed) are not tracked for PUSH
+    -   Drive-side changes are always detected on pull, but for the plugin to push your local edits up, make them through the Obsidian app
 -   If you ever encounter the following situation or vice versa, SYNC after you delete/rename it and before you rename/create the file/folder with the exact same path (this error arises from our plugin seeing a file convert into a folder or vice versa) (this doesn't apply for file to file or folder to folder):
     -   You have a file that has NO file extension already synced (most files have a file extension so you usually don't have to worry about this)
     -   You delete it/rename it
     -   You rename/create a folder with the exact same path
--   When activating this plugin on a new vault, make sure the vault is empty
-    -   If you have files that you want to sync to Google Drive from before the plugin, move them to another vault, delete them from the current vault, activate the plugin, and copy them back in **THROUGH THE OBSIDIAN APP**
+-   Activating on a non-empty vault is supported (adopt mode)
+    -   On the first sync, existing local files are matched to the Drive folder by path: files already present locally are kept as-is (never overwritten), and anything that exists only on Drive is downloaded
+    -   This makes it safe to point the plugin at a vault that Google Drive for Desktop already mirrors locally
+    -   Still **BACK UP** your vault before the first sync
 -   We suggest only editing Obsidian notes on one device at a time to avoid conflicts and syncing before editing on another device
     -   Our plugin does have code to handle conflicts, but it might not be perfect or as the user expects, so try to avoid them
 -   Make sure to sync with an adequate internet connection
@@ -77,18 +79,13 @@ Note: Instructions are also on this plugin's homepage with images at [https://og
 -   If you want to set your local vault state to the Google Drive state, run the `Set Local Vault to Google Drive` command
 -   If you mess with the vault's files while Obsidian is closed, try to revert any of the changes you made
 
-## Multiple Vaults
+## Choosing the Drive folder / Multiple Vaults
 
--   The Google Drive folder that gets created upon setup is the root folder for the vault and is tagged with the vault name
-    -   It is named the same as your vault name, has a matching description, and stores the vault name internally
-    -   You can rename the Google Drive folder without consequence
-    -   You can also color the folder in Google Drive and place it wherever you please
-    -   Each file in the vault is also tagged with the vault name inside Google Drive's properties
--   Each vault is connected to the Google Drive folder that has the same tag/internal name
-    -   If you want multiple devices to sync to the same vault, the vault names must match
--   You can have multiple vaults per Google account by having local vaults with different names
-    -   Do NOT rename local vaults that you are syncing to Google Drive
-    -   Instead, make a new vault, sync it, and transfer your files over
-    -   We will not add any implementation to automate this process because it inherently messes with other synced devices
+-   The plugin syncs the Google Drive folder whose **name matches your vault's name**
+    -   After the first sync it remembers that folder by its Drive ID, so you can then rename it, color it, and move it anywhere in your Drive without consequence
+-   If several Drive folders share your vault's name, set the exact **Root folder ID** in the plugin settings (find the ID in the folder's URL) to disambiguate
+-   If no matching folder is found, the plugin will NOT create one - create/populate the folder first (e.g. with Google Drive for Desktop), then sync
+-   You can have multiple vaults per Google account by giving each vault a distinct name / folder
+-   This plugin's own `data.json` (which holds your refresh token and device-local sync state) is never uploaded to Drive
 
 Privacy Policy: [https://ogd.richardxiong.com/privacy](https://ogd.richardxiong.com/privacy)
