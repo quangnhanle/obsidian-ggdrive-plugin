@@ -26,6 +26,10 @@ export interface DriveTreeNode {
 	// Lets a pull tell a genuinely-empty note apart from a file whose earlier
 	// download failed and left a 0-byte placeholder locally.
 	size?: string;
+	// The id whose bytes to download. Same as `id` normally; for a shortcut it is
+	// the target's id, so the node keeps its own stable identity (`id`) while the
+	// download reads the pointed-to file.
+	downloadId?: string;
 }
 
 export type DriveTree = Record<string, DriveTreeNode>;
@@ -54,6 +58,18 @@ interface QueryMatch {
 }
 
 export const folderMimeType = "application/vnd.google-apps.folder";
+
+// Google-native shortcut. A shortcut lives inside its parent folder but its
+// target's children are parented under the TARGET id, so a plain parent-walk
+// never descends into it - it has to be resolved via shortcutDetails.targetId.
+export const shortcutMimeType = "application/vnd.google-apps.shortcut";
+
+// Without these, files.list only returns items from the user's My Drive corpus:
+// anything living in (or shared in from) a Shared Drive is silently omitted, so
+// a parent-walk sees the folder but none of its children. Appended to every
+// list/get so shared and shared-with-me content is enumerable and downloadable.
+const ALL_DRIVES = "supportsAllDrives=true&includeItemsFromAllDrives=true";
+const SUPPORTS_ALL_DRIVES = "supportsAllDrives=true";
 
 export const BLACKLISTED_CONFIG_FILES = [
 	"graph.json",
@@ -160,7 +176,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			.get(
 				`drive/v3/files?fields=nextPageToken,files(${include.join(
 					","
-				)})&pageSize=${pageSize}&q=${
+				)})&pageSize=${pageSize}&${ALL_DRIVES}&q=${
 					matches ? getQuery(matches) : "trashed=false"
 				}${
 					matches?.find(({ query }) => query)
@@ -226,7 +242,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			if (t.settings.rootFolderId) {
 				const meta = await drive
 					.get(
-						`drive/v3/files/${t.settings.rootFolderId}?fields=id,trashed`
+						`drive/v3/files/${t.settings.rootFolderId}?fields=id,trashed&${SUPPORTS_ALL_DRIVES}`
 					)
 					.json<any>()
 					.catch(() => null);
@@ -403,10 +419,14 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 	};
 
 	const getFile = (id: string) =>
-		drive.get(`drive/v3/files/${id}?alt=media&acknowledgeAbuse=true`);
+		drive.get(
+			`drive/v3/files/${id}?alt=media&acknowledgeAbuse=true&${SUPPORTS_ALL_DRIVES}`
+		);
 
 	const getFileMetadata = (id: string) =>
-		drive.get(`drive/v3/files/${id}`).json<FileMetadata>();
+		drive
+			.get(`drive/v3/files/${id}?${SUPPORTS_ALL_DRIVES}`)
+			.json<FileMetadata>();
 
 	// Walks the whole folder tree under `rootId`, deriving each item's
 	// vault-relative path from its position in the tree (NOT from a `path`
@@ -442,12 +462,16 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				modifiedTime: string;
 				parents?: string[];
 				size?: string;
+				shortcutDetails?: {
+					targetId?: string;
+					targetMimeType?: string;
+				};
 			}[] = [];
 			let pageToken: string | undefined;
 			do {
 				const page = await drive
 					.get(
-						`drive/v3/files?fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents,size)&pageSize=1000&q=${encodeURIComponent(
+						`drive/v3/files?fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents,size,shortcutDetails(targetId,targetMimeType))&pageSize=1000&${ALL_DRIVES}&q=${encodeURIComponent(
 							q
 						)}${pageToken ? "&pageToken=" + pageToken : ""}`
 					)
@@ -463,6 +487,11 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 			return files;
 		};
+
+		// Maps a folder-shortcut's TARGET id back to the shortcut node's own id.
+		// The target's children are parented under the target id, so this lets
+		// them attach under the shortcut's path. Persists across BFS levels.
+		const shortcutTargetToNode: Record<string, string> = {};
 
 		let frontier = [rootId];
 		while (frontier.length) {
@@ -483,6 +512,10 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				modifiedTime: string;
 				parents?: string[];
 				size?: string;
+				shortcutDetails?: {
+					targetId?: string;
+					targetMimeType?: string;
+				};
 			}[];
 
 			const nextFrontier: string[] = [];
@@ -491,16 +524,32 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 				// A file may list several parents; use one inside the level we
 				// just queried so the derived path stays within the vault tree.
-				const parentId =
+				// A folder-shortcut's children arrive parented under the target
+				// id, so map that back to the shortcut node that owns the path.
+				const rawParentId =
 					file.parents?.find((p) => parentSet.has(p)) ??
 					file.parents?.[0];
-				const parent = parentId ? tree[parentId] : undefined;
+				const parentNodeId = rawParentId
+					? shortcutTargetToNode[rawParentId] ?? rawParentId
+					: undefined;
+				const parent = parentNodeId ? tree[parentNodeId] : undefined;
 				if (!parent) continue;
 
 				const path = parent.path
 					? `${parent.path}/${file.name}`
 					: file.name;
-				const isFolder = file.mimeType === folderMimeType;
+
+				// Resolve shortcuts to their target: the node keeps the shortcut's
+				// own id (stable identity) but takes on the target's type/bytes.
+				const isShortcut = file.mimeType === shortcutMimeType;
+				const targetId = isShortcut
+					? file.shortcutDetails?.targetId
+					: undefined;
+				const effectiveMime =
+					isShortcut && file.shortcutDetails?.targetMimeType
+						? file.shortcutDetails.targetMimeType
+						: file.mimeType;
+				const isFolder = effectiveMime === folderMimeType;
 
 				const rivalId = pathToId[path];
 				if (rivalId) {
@@ -521,15 +570,25 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				tree[file.id] = {
 					id: file.id,
 					path,
-					mimeType: file.mimeType,
+					mimeType: effectiveMime,
 					modifiedTime: file.modifiedTime,
 					parentId: parent.id,
 					isFolder,
 					size: file.size,
+					downloadId:
+						isShortcut && targetId ? targetId : undefined,
 				};
 				pathToId[path] = file.id;
 
-				if (isFolder) nextFrontier.push(file.id);
+				if (isFolder) {
+					// Descend using the target id for shortcuts so the target's
+					// children are discovered; remember the mapping back.
+					const queryId = isShortcut && targetId ? targetId : file.id;
+					nextFrontier.push(queryId);
+					if (queryId !== file.id) {
+						shortcutTargetToNode[queryId] = file.id;
+					}
+				}
 			}
 
 			frontier = nextFrontier;

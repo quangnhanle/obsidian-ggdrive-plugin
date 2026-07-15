@@ -298,7 +298,8 @@ export const pull = async (
 		// has content is a transient failure worth retrying with backoff - not a
 		// genuinely empty file.
 		const driveHasContent = driveHasBytes(node);
-		let content = await t.drive.getFile(node.id).arrayBuffer();
+		const downloadId = node.downloadId ?? node.id;
+		let content = await t.drive.getFile(downloadId).arrayBuffer();
 		for (
 			let attempt = 1;
 			attempt <= 4 && content.byteLength === 0 && driveHasContent;
@@ -310,7 +311,7 @@ export const pull = async (
 					400 * 2 ** attempt + Math.floor(Math.random() * 300)
 				)
 			);
-			content = await t.drive.getFile(node.id).arrayBuffer();
+			content = await t.drive.getFile(downloadId).arrayBuffer();
 		}
 
 		if (content.byteLength === 0) {
