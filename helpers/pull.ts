@@ -103,6 +103,33 @@ export const pull = async (
 		}
 	}
 
+	// True when Drive reports the file as having bytes. Folders and Google-native
+	// docs report no size, so default to true and let the download step decide.
+	const driveHasBytes = (node: DriveTreeNode) =>
+		node.size ? Number(node.size) > 0 : true;
+
+	// ---- Repair pass: a file we already track and that hasn't changed on Drive,
+	// but exists locally as a 0-byte placeholder (an earlier download failed and
+	// wrote an empty file), is queued for re-download. This is non-destructive -
+	// the local folder/file structure is kept intact; only the empty content is
+	// filled in. It makes every pull self-heal past download failures. ----
+	const queuedIds = new Set(
+		[...createNodes, ...modifyNodes].map((node) => node.id)
+	);
+	const repairCandidates = nodes.filter(
+		(node: DriveTreeNode) =>
+			!node.isFolder &&
+			!queuedIds.has(node.id) &&
+			!isConfigPath(node.path) &&
+			driveHasBytes(node)
+	);
+	await batchAsyncs(
+		repairCandidates.map((node: DriveTreeNode) => async () => {
+			const stat = await adapter.stat(node.path);
+			if (stat && stat.size === 0) modifyNodes.push(node);
+		})
+	);
+
 	// ---- Safety threshold: a truncated tree or a wrong root must never trigger
 	// a mass local deletion. ----
 	const prevCount = Object.keys(prev).length;
@@ -253,20 +280,52 @@ export const pull = async (
 					// First time we've seen this Drive id and a local file
 					// already exists with no pending change (e.g. a Google Drive
 					// for Desktop mirror): adopt the local copy as-is. No
-					// download, no re-push - assumed already in sync.
-					return;
+					// download, no re-push - assumed already in sync. EXCEPTION:
+					// a 0-byte local placeholder left by an earlier failed
+					// download, while Drive has real content, is re-fetched here
+					// instead of being adopted (self-heal, nothing deleted).
+					const stat = await adapter.stat(path);
+					const localEmpty = !stat || stat.size === 0;
+					if (!(localEmpty && driveHasBytes(node))) return;
 				}
 				// isModify with no local op -> Drive is authoritative; overwrite.
 			}
 		}
 
-		const content = await t.drive.getFile(node.id).arrayBuffer();
-
 		// A failed download comes back as an empty body (the response hook
-		// swallows HTTP errors). Never overwrite an existing non-empty local
-		// file with empty content - that corrupts files and, for plugin code,
-		// can disable the plugin.
+		// swallows HTTP errors). During a bulk clone, Google Drive rate-limits
+		// concurrent downloads (403/429), so an empty body for a file Drive says
+		// has content is a transient failure worth retrying with backoff - not a
+		// genuinely empty file.
+		const driveHasContent = driveHasBytes(node);
+		let content = await t.drive.getFile(node.id).arrayBuffer();
+		for (
+			let attempt = 1;
+			attempt <= 4 && content.byteLength === 0 && driveHasContent;
+			attempt++
+		) {
+			await new Promise((resolve) =>
+				setTimeout(
+					resolve,
+					400 * 2 ** attempt + Math.floor(Math.random() * 300)
+				)
+			);
+			content = await t.drive.getFile(node.id).arrayBuffer();
+		}
+
 		if (content.byteLength === 0) {
+			if (driveHasContent) {
+				// Still empty after retries though Drive has bytes. Leave the file
+				// as-is (don't write an empty placeholder over it); the next pull's
+				// repair pass will retry it.
+				new Notice(
+					`Skipped "${path}" - the download kept coming back empty (possible rate limit). Left it as-is; it will retry on the next pull.`
+				);
+				return;
+			}
+			// Drive genuinely has no bytes. Never overwrite an existing non-empty
+			// local file with empty content - that corrupts files and, for plugin
+			// code, can disable the plugin.
 			const stat = await adapter.stat(path);
 			if (stat && stat.size > 0) {
 				new Notice(

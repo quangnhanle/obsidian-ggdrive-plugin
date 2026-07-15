@@ -22,6 +22,10 @@ export interface DriveTreeNode {
 	modifiedTime: string;
 	parentId: string | null;
 	isFolder: boolean;
+	// Byte size of the file on Drive (absent for folders and Google-native docs).
+	// Lets a pull tell a genuinely-empty note apart from a file whose earlier
+	// download failed and left a 0-byte placeholder locally.
+	size?: string;
 }
 
 export type DriveTree = Record<string, DriveTreeNode>;
@@ -437,12 +441,13 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				mimeType: string;
 				modifiedTime: string;
 				parents?: string[];
+				size?: string;
 			}[] = [];
 			let pageToken: string | undefined;
 			do {
 				const page = await drive
 					.get(
-						`drive/v3/files?fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents)&pageSize=1000&q=${encodeURIComponent(
+						`drive/v3/files?fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents,size)&pageSize=1000&q=${encodeURIComponent(
 							q
 						)}${pageToken ? "&pageToken=" + pageToken : ""}`
 					)
@@ -477,6 +482,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				mimeType: string;
 				modifiedTime: string;
 				parents?: string[];
+				size?: string;
 			}[];
 
 			const nextFrontier: string[] = [];
@@ -519,6 +525,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 					modifiedTime: file.modifiedTime,
 					parentId: parent.id,
 					isFolder,
+					size: file.size,
 				};
 				pathToId[path] = file.id;
 
