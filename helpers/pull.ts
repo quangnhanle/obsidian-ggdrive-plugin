@@ -60,8 +60,16 @@ export const pull = async (
 	const isConfigPath = (path: string) =>
 		path === configDir || path.startsWith(configDir + "/");
 
+	// Skip any path whose name (or any ancestor folder's name) starts with a
+	// dot, e.g. .obsidian, .claude, .claudian, .git, .trash. Hidden entries are
+	// never pulled down from Drive, per the user's request.
+	const isHiddenPath = (path: string) =>
+		path.split("/").some((segment) => segment.startsWith("."));
+
 	const prev = t.settings.driveSnapshot || {};
-	const nodes = Object.values(tree).filter((node) => node.path !== "");
+	const nodes = Object.values(tree)
+		.filter((node: DriveTreeNode) => node.path !== "")
+		.filter((node: DriveTreeNode) => !isHiddenPath(node.path));
 	const newById: Record<string, DriveTreeNode> = Object.fromEntries(
 		nodes.map((node) => [node.id, node])
 	);
@@ -87,6 +95,9 @@ export const pull = async (
 		}
 	}
 	for (const [id, entry] of Object.entries(prev)) {
+		// Hidden paths are never pulled, so never treat them as remote deletions
+		// either - leave any local hidden files untouched.
+		if (isHiddenPath(entry.path)) continue;
 		if (!newById[id]) {
 			removePaths.push({ path: entry.path, isFolder: entry.isFolder });
 		}

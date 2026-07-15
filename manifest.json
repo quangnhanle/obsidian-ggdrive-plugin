@@ -4,7 +4,7 @@
 	"version": "2.2.2",
 	"minAppVersion": "1.6.0",
 	"description": "Syncs a vault into Google Drive for cross-platform use (works for iOS).",
-	"author": "Richard Xiong",
+	"author": "Le Quang Nhan",
 	"authorUrl": "https://obsidian-google-drive-website-ten.vercel.app",
 	"isDesktopOnly": false
 }
